@@ -147,6 +147,9 @@ class SkillAnalyzer:
     ) -> Tuple[float, int, int]:
         """
         Calculate match percentage using K-Means clustering.
+        Group job postings into sub-profiles (Career Tracks),
+        identify the resume's target Career Track, and calculate the average
+        match percentage within that Career Track.
         
         Args:
             resume: User's resume
@@ -162,42 +165,155 @@ class SkillAnalyzer:
         if len(master_skills) == 0:
             raise ValueError("No skills found for clustering")
         
-        # Step 2: Create feature vectors (skill presence matrix)
-        resume_vector = self._create_skill_vector(resume.skills, master_skills)
-        job_vectors = [self._create_skill_vector(job.required_skills, master_skills) 
-                      for job in jobs]
+        # Step 2: Create TF-IDF weighted feature vectors
+        resume_tfidf, job_tfidfs = self._calculate_tfidf_vectors(resume, jobs, master_skills)
         
         # Combine all vectors (resume + all jobs)
-        all_vectors = np.vstack([resume_vector, np.array(job_vectors)])
+        all_vectors = np.vstack([resume_tfidf, job_tfidfs])
         
-        # Step 3: Normalize features (optional but recommended)
+        # Step 3: Normalize features
         scaler = StandardScaler()
         all_vectors_scaled = scaler.fit_transform(all_vectors)
         
-        # Step 4: Apply K-Means clustering
-        n_clusters = min(self.n_clusters, len(all_vectors))  # Don't exceed data points
-        kmeans = KMeans(
-            n_clusters=n_clusters,
-            random_state=42,
-            n_init=10,
-            max_iter=300
-        )
-        cluster_labels = kmeans.fit_predict(all_vectors_scaled)
+        # Step 4: Apply K-Means clustering with Dynamic K Optimization (maximizing Silhouette Score)
+        best_k = min(self.n_clusters, len(all_vectors))
+        best_labels = None
+        best_score = -1.0
         
-        # Step 5: Determine resume's cluster
+        # Test K from 2 to min(5, len(all_vectors) - 1)
+        max_possible_k = min(5, len(all_vectors) - 1)
+        if max_possible_k >= 2:
+            from sklearn.metrics import silhouette_score
+            for k in range(2, max_possible_k + 1):
+                try:
+                    kmeans = KMeans(
+                        n_clusters=k,
+                        random_state=42,
+                        n_init=10,
+                        max_iter=300
+                    )
+                    labels = kmeans.fit_predict(all_vectors_scaled)
+                    unique_labels = len(np.unique(labels))
+                    
+                    if unique_labels > 1:
+                        score = float(silhouette_score(all_vectors_scaled, labels))
+                        logger.info(f"K-Means Silhouette Score for K={k}: {score:.4f}")
+                        if score > best_score:
+                            best_score = score
+                            best_k = k
+                            best_labels = labels
+                except Exception as ex:
+                    logger.warning(f"Failed evaluation for K={k}: {ex}")
+        
+        # Fallback if no optimization succeeded
+        if best_labels is None:
+            n_clusters = min(self.n_clusters, len(all_vectors))
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                random_state=42,
+                n_init=10,
+                max_iter=300
+            )
+            best_labels = kmeans.fit_predict(all_vectors_scaled)
+            best_k = n_clusters
+            logger.info(f"Using default K-Means clustering with K={best_k}")
+        else:
+            logger.info(f"Selected optimal K-Means clustering with K={best_k} (Silhouette Score: {best_score:.4f})")
+            
+        cluster_labels = best_labels
+        
+        # Step 5: Determine resume's cluster (Target Career Track)
         resume_cluster = cluster_labels[0]
         
         # Step 6: Count jobs in same cluster as resume
         job_clusters = cluster_labels[1:]  # Exclude resume (first element)
-        jobs_in_same_cluster = np.sum(job_clusters == resume_cluster)
+        jobs_in_same_cluster_mask = (job_clusters == resume_cluster)
+        jobs_in_same_cluster = int(np.sum(jobs_in_same_cluster_mask))
         
-        # Step 7: Calculate match percentage
-        match_percentage = (jobs_in_same_cluster / len(jobs)) * 100
+        # Step 7: Calculate match percentage as the average match within the target track
+        if jobs_in_same_cluster > 0:
+            matching_job_indices = np.where(jobs_in_same_cluster_mask)[0]
+            match_percentages = [
+                jobs[idx].calculate_match_percentage(resume.skills)
+                for idx in matching_job_indices
+            ]
+            match_percentage = float(np.mean(match_percentages))
+        else:
+            # Fallback to simple average across all jobs
+            match_percentages = [
+                job.calculate_match_percentage(resume.skills)
+                for job in jobs
+            ]
+            match_percentage = float(np.mean(match_percentages)) if match_percentages else 0.0
         
         logger.info(f"Clustering results: Resume in cluster {resume_cluster}, "
-                   f"{jobs_in_same_cluster}/{len(jobs)} jobs in same cluster")
+                   f"{jobs_in_same_cluster}/{len(jobs)} jobs in same cluster. "
+                   f"Average Track Match: {match_percentage:.2f}%")
         
-        return round(match_percentage, 2), int(resume_cluster), int(jobs_in_same_cluster)
+        return round(match_percentage, 2), int(resume_cluster), jobs_in_same_cluster
+
+    def _calculate_tfidf_vectors(
+        self,
+        resume: Resume,
+        jobs: List[Job],
+        master_skills: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate TF-IDF weighted vectors for the resume and jobs.
+        
+        Returns:
+            Tuple of (resume_tfidf_vector, jobs_tfidf_vectors)
+        """
+        total_docs = len(jobs) + 1  # All jobs + 1 resume
+        
+        # Calculate Document Frequency (DF) for each master skill
+        df = np.zeros(len(master_skills))
+        
+        # Count resume skills
+        user_skills_lower = {s.name.lower() for s in resume.skills}
+        for i, skill in enumerate(master_skills):
+            if skill in user_skills_lower:
+                df[i] += 1
+                
+        # Count job skills
+        for job in jobs:
+            job_skills_lower = {s.name.lower() for s in job.required_skills}
+            for i, skill in enumerate(master_skills):
+                if skill in job_skills_lower:
+                    df[i] += 1
+                    
+        # Compute smoothed Inverse Document Frequency (IDF)
+        # IDF = ln((1 + total_docs) / (1 + DF)) + 1
+        # Prevent division by zero: df is >= 0, so 1+df is >= 1
+        idf = np.log((1 + total_docs) / (1 + df)) + 1
+        
+        # Create binary presence vectors
+        resume_binary = self._create_skill_vector(resume.skills, master_skills)
+        job_binaries = np.array([self._create_skill_vector(job.required_skills, master_skills) 
+                                for job in jobs])
+        
+        # TF-IDF vectors (element-wise multiplication with IDF weights)
+        resume_tfidf = resume_binary * idf
+        job_tfidfs = job_binaries * idf
+        
+        return resume_tfidf, job_tfidfs
+
+    def _calculate_jaccard_similarity(self, vector1: np.ndarray, vector2: np.ndarray) -> float:
+        """Calculate Jaccard similarity between two binary vectors (0-100)"""
+        intersection = np.logical_and(vector1, vector2).sum()
+        union = np.logical_or(vector1, vector2).sum()
+        if union == 0:
+            return 0.0
+        return float(intersection / union) * 100
+
+    def _calculate_cosine_similarity(self, vector1: np.ndarray, vector2: np.ndarray) -> float:
+        """Calculate Cosine similarity between two binary vectors (0-100)"""
+        dot_product = np.dot(vector1, vector2)
+        norm1 = np.linalg.norm(vector1)
+        norm2 = np.linalg.norm(vector2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return float(dot_product / (norm1 * norm2)) * 100
     
     def _create_master_skill_list(self, resume: Resume, jobs: List[Job]) -> List[str]:
         """

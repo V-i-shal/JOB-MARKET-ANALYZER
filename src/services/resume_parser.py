@@ -157,8 +157,22 @@ class ResumeParser:
         if not text:
             return ""
 
-        text = re.sub(r"\s+", " ", text)
+        # Convert \r\n and \r to \n
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Replace multiple spaces/tabs with a single space
+        text = re.sub(r"[ \t]+", " ", text)
+
+        # Replace multiple consecutive newlines with a single newline
+        text = re.sub(r"\n+", "\n", text)
+
+        # Keep existing non-ASCII character removal
         text = re.sub(r"[^\x00-\x7F]+", " ", text)
+
+        # Strip individual lines and collapse double spaces
+        text = "\n".join(line.strip() for line in text.split("\n"))
+        text = re.sub(r" +", " ", text)
+
         return text.strip()
 
     def extract_basic_info(self, resume: Resume) -> None:

@@ -10,6 +10,7 @@ from loguru import logger
 
 from ..models.job import Job
 from ..models.skill import Skill
+from .skill_extractor import SkillExtractor
 
 
 class JobFetcher:
@@ -30,6 +31,8 @@ class JobFetcher:
             logger.warning("Adzuna API credentials not found. Using sample jobs.")
         else:
             logger.info("Adzuna API credentials loaded")
+            
+        self.skill_extractor = SkillExtractor()
 
     def fetch_jobs(self, query: str, count: int = 50) -> List[Job]:
         if self.app_id and self.api_key:
@@ -89,17 +92,7 @@ class JobFetcher:
             return None
 
     def _extract_skills_from_description(self, description: str) -> List[Skill]:
-        keywords = [
-            "python", "java", "javascript", "react", "node.js", "django",
-            "flask", "sql", "aws", "docker", "kubernetes", "git"
-        ]
-
-        skills = []
-        desc = description.lower()
-        for kw in keywords:
-            if kw in desc:
-                skills.append(Skill(name=kw.title(), category="Technical"))
-        return skills
+        return self.skill_extractor.extract_skills(description)
 
     def _create_sample_jobs(self, domain: str, count: int) -> List[Job]:
         domain = domain.lower()
